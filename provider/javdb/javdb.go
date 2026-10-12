@@ -8,6 +8,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gocolly/colly/v2"
 	"golang.org/x/text/language"
@@ -46,6 +47,7 @@ var ErrLoginRequired = errors.New("javdb: login required, set MT_MOVIE_PROVIDER_
 type JavDB struct {
 	*scraper.Scraper
 	cookie string
+	queue  *requestQueue
 }
 
 func New() *JavDB {
@@ -60,19 +62,55 @@ func New() *JavDB {
 				{Name: "over18", Value: "1"},
 				{Name: "locale", Value: "zh"},
 			})),
+		queue: newRequestQueue(),
 	}
 }
 
 func (db *JavDB) SetConfig(config provider.Config) error {
-	if !config.Has(cookieConfigKey) {
-		return nil
+	if config.Has(cookieConfigKey) {
+		cookie, err := config.GetString(cookieConfigKey)
+		if err != nil {
+			return err
+		}
+		db.cookie = strings.TrimSpace(cookie)
 	}
-	cookie, err := config.GetString(cookieConfigKey)
-	if err != nil {
-		return err
+	for key, target := range map[string]*time.Duration{
+		"interval":      &db.queue.interval,
+		"queue_timeout": &db.queue.queueTimeout,
+		"cooldown":      &db.queue.cooldown,
+	} {
+		if config.Has(key) {
+			v, err := config.GetDuration(key)
+			if err != nil {
+				return err
+			}
+			*target = v
+		}
 	}
-	db.cookie = strings.TrimSpace(cookie)
 	return nil
+}
+
+// visit sends a request through the shared queue; followUp marks requests
+// that belong to a search already in progress (see requestQueue). If JavDB
+// pushes back (429, or the 403 it escalates to), every queued request cools
+// down and this one is retried once.
+func (db *JavDB) visit(c *colly.Collector, rawURL string, followUp bool) error {
+	for attempt := 0; ; attempt++ {
+		if err := db.queue.acquire(followUp); err != nil {
+			return err
+		}
+		err := c.Visit(rawURL)
+		if err == nil || attempt > 0 || !isThrottled(err) {
+			return err
+		}
+		db.queue.backoff()
+	}
+}
+
+func isThrottled(err error) bool {
+	// colly reports non-2xx responses as their status text.
+	msg := err.Error()
+	return msg == http.StatusText(http.StatusTooManyRequests) || msg == http.StatusText(http.StatusForbidden)
 }
 
 func (db *JavDB) collector() *colly.Collector {
@@ -212,7 +250,7 @@ func (db *JavDB) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err er
 		}
 	})
 
-	if err = c.Visit(info.Homepage); err != nil {
+	if err = db.visit(c, info.Homepage, true); err != nil {
 		return nil, err
 	}
 	if loginRequired {
@@ -254,7 +292,7 @@ func (db *JavDB) SearchMovie(keyword string) (results []*model.MovieSearchResult
 		})
 	})
 
-	if err = c.Visit(fmt.Sprintf(searchURL, url.QueryEscape(keyword))); err != nil {
+	if err = db.visit(c, fmt.Sprintf(searchURL, url.QueryEscape(keyword)), false); err != nil {
 		return nil, err
 	}
 
@@ -278,7 +316,7 @@ func (db *JavDB) requiresLogin(rawURL string) (loginRequired bool) {
 	c.OnResponse(func(r *colly.Response) {
 		loginRequired = isLoginPage(r)
 	})
-	_ = c.Visit(rawURL)
+	_ = db.visit(c, rawURL, true)
 	return
 }
 
