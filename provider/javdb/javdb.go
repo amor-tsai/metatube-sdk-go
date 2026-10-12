@@ -254,8 +254,43 @@ func (db *JavDB) SearchMovie(keyword string) (results []*model.MovieSearchResult
 		})
 	})
 
-	err = c.Visit(fmt.Sprintf(searchURL, url.QueryEscape(keyword)))
+	if err = c.Visit(fmt.Sprintf(searchURL, url.QueryEscape(keyword))); err != nil {
+		return nil, err
+	}
+
+	// Search results carry no censored/uncensored marker, and NormalizeMovieKeyword's
+	// number.IsSpecial check misses many uncensored series (e.g. LAFBD). Without a
+	// session, probe the exact match: if its page redirects to /login, so would its
+	// details and cover, so offer nothing. Same-series near misses are dropped too,
+	// as they are just as unfetchable.
+	if db.cookie == "" {
+		for _, result := range results {
+			if isSameNumber(result.Number, keyword) && db.requiresLogin(result.Homepage) {
+				return nil, nil
+			}
+		}
+	}
 	return
+}
+
+func (db *JavDB) requiresLogin(rawURL string) (loginRequired bool) {
+	c := db.collector()
+	c.OnResponse(func(r *colly.Response) {
+		loginRequired = isLoginPage(r)
+	})
+	_ = c.Visit(rawURL)
+	return
+}
+
+// isSameNumber reports whether a JavDB number matches the keyword, ignoring
+// case and separators, and allowing a studio prefix on the keyword
+// (e.g. "300MIUM-526" vs "MIUM-526").
+func isSameNumber(number, keyword string) bool {
+	normalize := func(s string) string {
+		return strings.ToUpper(regexp.MustCompile(`[^a-zA-Z\d]`).ReplaceAllString(s, ""))
+	}
+	n, k := normalize(number), normalize(keyword)
+	return n != "" && strings.HasSuffix(k, n)
 }
 
 func init() {
